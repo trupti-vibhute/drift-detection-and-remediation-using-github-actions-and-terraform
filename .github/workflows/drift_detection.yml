@@ -61,9 +61,30 @@ jobs:
       - name: Terraform Init
         run: terraform init -backend-config="backend-${{ env.ENVIRONMENT }}.hcl"
 
+      # Drift only exists for infrastructure that has been deployed. With an empty state
+      # (not deployed yet, or destroyed), plan would report everything as "drift" and the
+      # auto-fix would build the whole environment without any approval - so skip instead.
+      - name: Check Environment Is Deployed
+        id: state
+        run: |
+          # state pull (unlike state list) succeeds even when no state file exists yet.
+          # Count only "managed" resources - data sources like aws_ami are lookups, not infrastructure.
+          COUNT=$(terraform state pull | jq '[.resources[]? | select(.mode == "managed")] | length')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "deployed=false" >> $GITHUB_OUTPUT
+            echo "Nothing deployed in $ENVIRONMENT yet - skipping drift check."
+            echo "### ⏭️ Drift check skipped [$ENVIRONMENT]" >> $GITHUB_STEP_SUMMARY
+            echo "The state is empty - nothing has been deployed (or it was destroyed)." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "deployed=true" >> $GITHUB_OUTPUT
+            echo "$COUNT managed resources in $ENVIRONMENT state."
+          fi
+
       # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes needed (drift)
+      # Every step below depends on this step's exitcode, so they all skip when it is skipped
       - name: Terraform Plan (Drift Check)
         id: plan
+        if: steps.state.outputs.deployed == 'true'
         run: |
           set +e  # exit code 2 is not a failure here - capture it instead of stopping
           terraform plan -detailed-exitcode -no-color -out=driftplan > plan_output.txt 2>&1
