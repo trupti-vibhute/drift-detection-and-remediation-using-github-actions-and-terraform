@@ -54,6 +54,10 @@ resource "aws_autoscaling_group" "app_asg" {
   lifecycle {
     ignore_changes = [desired_capacity]
   }
+
+  # Instances download Docker + the app image on first boot, so the private
+  # subnets must already have their route to the NAT Gateway
+  depends_on = [aws_route.private_nat, aws_route_table_association.private]
 }
 
 # Target Tracking Scaling - keeps average CPU across the group around 70%
