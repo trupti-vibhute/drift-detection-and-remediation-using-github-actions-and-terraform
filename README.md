@@ -5,8 +5,6 @@ workflow keeps checking that the real infrastructure still matches the code. Whe
 something by hand (for example, opens SSH to the internet in the console), the change is **detected,
 recorded as a GitHub Issue, and automatically reverted**.
 
-> Final project (Day 30) of the **30 Days of AWS Terraform** course by Piyush Sachdeva,
-> rebuilt for `ap-south-1` with two environments and a number of fixes to the reference code.
 
 ![Terraform](https://img.shields.io/badge/Terraform-%3E%3D1.10-623CE4?logo=terraform)
 ![AWS](https://img.shields.io/badge/AWS-ap--south--1-FF9900?logo=amazonaws)
