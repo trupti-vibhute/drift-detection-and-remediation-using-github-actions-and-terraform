@@ -1,0 +1,35 @@
+# Terraform working directories (providers are re-downloaded by terraform init)
+.terraform/
+
+# State files - main project state lives in S3; never commit state (it can contain sensitive values)
+# Note: bootstrap/terraform.tfstate is local-only, keep it safe on your machine
+*.tfstate
+*.tfstate.*
+
+# Saved plans and workflow output files
+tfplan
+driftplan
+*.tfplan
+plan_output.txt
+apply_output.txt
+destroy_plan.txt
+destroy_output.txt
+
+# Local variable overrides and CLI config
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Crash logs
+crash.log
+crash.*.log
+
+# OS files
+.DS_Store
+
+# NOTE: .terraform.lock.hcl is intentionally NOT ignored - commit it so CI uses the same provider versions

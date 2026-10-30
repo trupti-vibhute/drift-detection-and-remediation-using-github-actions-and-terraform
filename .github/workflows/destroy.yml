@@ -1,0 +1,184 @@
+name: "Terraform Destroy"
+
+# Manual only - tears down ONE environment after typing DESTROY
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to destroy"
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      confirm_destroy:
+        description: 'Type "DESTROY" to confirm deletion'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  actions: write # needed to disable the drift detection workflow before destroying prod
+
+# Same group names as terraform.yml / drift_detection.yml - never destroy while a deploy or drift check is running
+concurrency:
+  group: terraform-${{ inputs.environment == 'dev' && 'dev' || 'main' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  TF_VERSION: "1.10.3"
+  ENVIRONMENT: ${{ inputs.environment }}
+  TF_VAR_environment: ${{ inputs.environment }}
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+jobs:
+  terraform-destroy:
+    name: "Destroy ${{ inputs.environment }} Infrastructure"
+    runs-on: ubuntu-latest
+    # prod can require a manual approval here (Settings -> Environments -> prod -> Required reviewers)
+    environment: ${{ inputs.environment }}
+
+    steps:
+      # Checked first, before touching AWS at all
+      - name: Verify Destroy Confirmation
+        run: |
+          if [ "${{ inputs.confirm_destroy }}" != "DESTROY" ]; then
+            echo "::error::You must type DESTROY exactly to confirm. Nothing was deleted."
+            exit 1
+          fi
+          echo "✅ Destroy confirmation verified for $ENVIRONMENT"
+
+      # Otherwise the next scheduled drift check would see every resource "missing" and recreate it all
+      - name: Disable Scheduled Drift Detection (prod)
+        if: inputs.environment == 'prod'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.disableWorkflow({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'drift_detection.yml'
+            });
+            core.info('Drift detection workflow disabled. Re-enable it in the Actions tab after redeploying prod.');
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.environment == 'dev' && 'dev' || 'main' }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config="backend-${{ env.ENVIRONMENT }}.hcl"
+
+      # Record what is about to be deleted on the run's summary page
+      - name: Terraform Destroy Plan
+        run: |
+          set -o pipefail
+          terraform plan -destroy -no-color | tee destroy_plan.txt
+          {
+            echo "### 🗑️ Resources to be Destroyed [$ENVIRONMENT]"
+            echo "<details><summary>Destroy Plan</summary>"
+            echo ""
+            echo '```'
+            cat destroy_plan.txt
+            echo '```'
+            echo "</details>"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Terraform Destroy
+        id: destroy
+        run: |
+          # pipefail: without it the step would report tee's result (always success) even if destroy failed
+          set -o pipefail
+          terraform destroy -auto-approve -no-color 2>&1 | tee destroy_output.txt
+        continue-on-error: true
+
+      - name: Create Destroy Report Issue
+        uses: actions/github-script@v7
+        env:
+          DESTROY_OUTCOME: ${{ steps.destroy.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
+            const success = process.env.DESTROY_OUTCOME === 'success';
+            const destroyOutput = fs.existsSync('destroy_output.txt')
+              ? fs.readFileSync('destroy_output.txt', 'utf8') : 'No output captured';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const body = `### Infrastructure Destruction Report
+
+            **Environment:** \`${env}\`
+            **Status:** ${success ? '✅ Success' : '❌ Failed'}
+            **Triggered by:** @${context.actor}
+            **Workflow run:** ${runUrl}
+
+            <details>
+            <summary>Destroy Output</summary>
+
+            \`\`\`
+            ${destroyOutput.slice(-60000)}
+            \`\`\`
+
+            </details>
+
+            ${success
+              ? '✅ All resources have been destroyed.'
+              : '⚠️ Some resources may still exist. Review the logs, then re-run this workflow or clean up manually.'}
+            ${env === 'prod' ? '\n> ℹ️ Scheduled drift detection was disabled. Re-enable it in the Actions tab after redeploying prod.' : ''}`;
+
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: success ? `✅ Infrastructure Destroyed [${env}]` : `❌ Infrastructure Destroy Failed [${env}]`,
+              body: body,
+              labels: ['infrastructure', 'destroy', env]
+            });
+
+            // A successful destroy leaves nothing to track - close the report straight away
+            if (success) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed'
+              });
+            }
+
+      - name: Notify Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          DESTROY_OUTCOME: ${{ steps.destroy.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$DESTROY_OUTCOME" = "success" ]; then
+            TEXT="🗑️ *$ENVIRONMENT* infrastructure destroyed by ${{ github.actor }}"
+          else
+            TEXT="❌ Destroy of *$ENVIRONMENT* FAILED - some resources may still exist"
+          fi
+          jq -n --arg text "$TEXT" --arg repo "${{ github.repository }}" --arg url "$RUN_URL" \
+            '{text: ($text + "\nRepository: " + $repo + "\n<" + $url + "|View workflow run>")}' \
+          | curl -sf -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+
+      - name: Destroy Status
+        run: |
+          if [ "${{ steps.destroy.outcome }}" = "success" ]; then
+            echo "### ✅ $ENVIRONMENT destroyed successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ $ENVIRONMENT destroy failed - check AWS console and logs" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi

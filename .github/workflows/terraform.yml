@@ -1,0 +1,185 @@
+name: "Terraform CI/CD"
+
+# dev branch  -> dev environment  (backend-dev.hcl,  environment=dev)
+# main branch -> prod environment (backend-prod.hcl, environment=prod)
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Never run two Terraform jobs against the same environment at once
+# (drift_detection.yml uses the same group, so a drift check waits for a deploy and vice versa)
+concurrency:
+  group: terraform-${{ github.base_ref || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  TF_VERSION: "1.10.3"
+
+jobs:
+  terraform-plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env-vars.outputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine Environment
+        id: env-vars
+        run: |
+          # On a PR, deploy target is the branch being merged INTO
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BRANCH_NAME="${{ github.base_ref }}"
+          else
+            BRANCH_NAME="${{ github.ref_name }}"
+          fi
+
+          if [[ "$BRANCH_NAME" == "main" ]]; then
+            ENVIRONMENT=prod
+          else
+            ENVIRONMENT=dev
+          fi
+
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+          # Terraform reads TF_VAR_<name> as the value of var.<name>
+          echo "TF_VAR_environment=$ENVIRONMENT" >> $GITHUB_ENV
+          echo "Deploying to: $ENVIRONMENT"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config="backend-${{ env.ENVIRONMENT }}.hcl"
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          # pipefail: without it, the step's result would be tee's (always success), hiding plan errors
+          set -o pipefail
+          terraform plan -no-color -out=tfplan | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('plan_output.txt', 'utf8');
+
+            const output = `#### Terraform Plan for \`${{ env.ENVIRONMENT }}\` Environment 🌍
+
+            <details>
+            <summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${planOutput.slice(0, 60000)}
+            \`\`\`
+
+            </details>
+
+            - **Format:** \`${{ steps.fmt.outcome }}\`
+            - **Validate:** \`${{ steps.validate.outcome }}\`
+            - **Plan:** \`${{ steps.plan.outcome }}\`
+
+            *Pushed by: @${{ github.actor }}*`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}
+          path: tfplan
+          retention-days: 5
+
+  terraform-apply:
+    name: "Terraform Apply"
+    needs: terraform-plan
+    # Only real pushes deploy - PRs stop after the plan
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # Ties the job to the GitHub environment (dev/prod) - prod can require manual approval
+    environment: ${{ needs.terraform-plan.outputs.environment }}
+    env:
+      ENVIRONMENT: ${{ needs.terraform-plan.outputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config="backend-${{ env.ENVIRONMENT }}.hcl"
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}
+
+      # Applies exactly what was planned (the saved plan already contains environment=<env>)
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Output Infrastructure Info
+        run: |
+          echo "### 🚀 Infrastructure Deployed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** $ENVIRONMENT" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
